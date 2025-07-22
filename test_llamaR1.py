@@ -37,43 +37,25 @@ from llama_real_share.modeling_llama_kvsharer import LlamaForCausalLM
 # ### Load Model
 # 模型加载与校准数据准备
 
-# In[31]:
 
 # llama_path = 'meta-llama/Llama-2-7b-hf'
 llama_path = 'deepseek-ai/DeepSeek-R1-Distill-Llama-8B'
 
-
-# In[28]:
-
-
 download_dir="/mnt/sh_flex_storage/home/xiangyiz/project/Symbolic-MoE/saved_models"
-
-
-# In[29]:
-
 
 # 加载模型和分词器
 tokenizer = AutoTokenizer.from_pretrained(llama_path, trust_remote_code=True)
 
-
-# In[ ]:
 llama = AutoModelForCausalLM.from_pretrained(llama_path, trust_remote_code=True).to('cuda')
 # llama = LlamaForCausalLM.from_pretrained(llama_path, device_map='auto', trust_remote_code=True, local_files_only=True, cache_dir=download_dir)
 
 
 # ### Load Calibration Dataset
 
-# In[ ]:
-
-
 wiki_data_path = './data/wiki_demo.txt'
 with open(wiki_data_path, 'r') as f:
     wiki_data = f.readlines()
     f.close()
-
-
-# In[ ]:
-
 
 calibration_set = wiki_data[0:30] # 使用前30个样本进行校准
 
@@ -83,9 +65,6 @@ calibration_set = wiki_data[0:30] # 使用前30个样本进行校准
 # 校准阶段：捕获每层的 KV 缓存
 # - 对每个校准样本，执行前向传播并捕获每层的 KV 缓存（Key/Value）。
 # - kv_cache_list 的结构为 [num_samples][num_layers][key, value]。
-
-# In[ ]:
-
 
 from tqdm import tqdm
 import torch
@@ -100,9 +79,6 @@ with torch.no_grad():
         past_key_values = out.past_key_values
         # 保存每层的 Key 和 Value 缓存
         kv_cache_list.append(past_key_values)
-
-
-# In[ ]:
 
 
 num_layers = len(kv_cache_list[0])
@@ -130,8 +106,6 @@ avg_past_key_values = [(key / num_elements, value / num_elements) for key, value
 # - 展平操作: 将每层的 Key 和 Value 缓存展平为一维向量
 # - 欧氏距离计算: 量化任意两层 KV 缓存的不相似性
 # - 排序:按距离从大到小排列层对
-
-# In[ ]:
 
 
 import torch
@@ -165,9 +139,6 @@ for i in range(num_layers):
             similarity_matrix[i, j] = np.nan
 
 
-# In[ ]:
-
-
 # 排序层对
 # 将相似度矩阵展平并过滤无效值（NaN），按欧氏距离从大到小排序
 flattened_values = similarity_matrix.flatten()
@@ -192,17 +163,11 @@ for i in range(sorted_positions[0].shape[0]):
 
 # ### Initialize the Sharing Layers and THRESHOLD
 
-# In[ ]:
-
-
 SHARE_LAYERS = 4
 THRESHOLD = 0.5
 
 
-# In[ ]:
-
-
-# 验证输出相似性 
+# 验证输出相似性
 # 对每个校准样本，比较替换策略下模型与原始模型的输出表示相似性（通过余弦相似度）
 import numpy as np
 def cal_last_hidden_sim(model1, model2, kv_cache_share_layers_map, tokenizer, sents):
@@ -228,9 +193,6 @@ def cal_last_hidden_sim(model1, model2, kv_cache_share_layers_map, tokenizer, se
     return np.mean(sim_ls)
 
 
-# In[ ]:
-
-
 # 按排序后的层对依次尝试替换
 def re_map(kv_cache_share_layers_map):
     tmp_kv_cache_share_layers_map = {}
@@ -243,9 +205,6 @@ def re_map(kv_cache_share_layers_map):
 
 
 # ### Strategy Searching
-
-# In[ ]:
-
 
 from copy import deepcopy
 
@@ -280,15 +239,10 @@ for pair in tqdm(pos_rank):
         break
 
 
-# In[ ]:
-
-
 print(kv_cache_share_layers_map)
 
 
 # ### Inference with KVSharer
-
-# In[ ]:
 
 
 def get_model_responses(model, tokenizer, sent, kv_cache_share_layers_map=None):
@@ -303,8 +257,6 @@ def get_valid_responses(row, answer_columns):
         if pd.notna(row[col]) and pd.notnull(row[col]):
             responses[col] = row[col]
     return responses
-
-# In[ ]:
 
 # sent = 'Hello, what is your name'
 def create_folder(folder_path):
