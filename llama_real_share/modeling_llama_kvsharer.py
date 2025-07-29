@@ -1000,7 +1000,6 @@ class LlamaModel(LlamaPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         kv_cache_share_layers_map: Optional[Dict] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        import ipdb;ipdb.set_trace()
         print('kv_cache_share_layers_map_llamamodel', kv_cache_share_layers_map)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
