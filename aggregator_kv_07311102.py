@@ -107,16 +107,12 @@ class KVCacheManager:
                 except:
                     pass
         
-        # 对累加后的 Key 和 Value 取平均值，得到每层的平均 KV 缓存
         num_elements = len(self.kv_cache_list)
         self.avg_past_key_values = [(key / num_elements, value / num_elements) for key, value in avg_past_key_values]
     
-    # 计算两个张量（如 KV 缓存）的余弦相似度
     def compute_cosine_similarity(self, tensor1, tensor2):
         return F.cosine_similarity(tensor1.flatten(1), tensor2.flatten(1), dim=-1).mean().item()
     
-    # 计算两个张量之间的欧氏距离（值越大表示越不相似）
-    # 用于量化任意两层的不相似性（距离越大越优先替换)
     def compute_euclidean_distance(self, tensor1, tensor2):
         return torch.norm(tensor1 - tensor2, p=2, dim=-1).mean().item()
     
@@ -126,12 +122,8 @@ class KVCacheManager:
         self.average_kv_cache()
         num_layers = len(self.avg_past_key_values)
         
-        # 初始化距离矩阵
         distance_matrix = np.zeros((num_layers, num_layers))
         
-        # 计算每层之间的余弦相似度
-        # 构建相似度矩阵
-        # 遍历所有层对，计算每对的 Key 和 Value 的欧氏距离 ，并存储到 similarity_matrix 矩阵中。
         # 仅计算上三角部分（i > j），避免重复计算。
         for i in range(num_layers):
             for j in range(num_layers):
@@ -147,13 +139,10 @@ class KVCacheManager:
         return distance_matrix
     
     def sort_distance(self):
-        # 排序层对
-        # 将相似度矩阵展平并过滤无效值（NaN），按欧氏距离从大到小排序
         distance_matrix = self.analyze_kv_similarity()
         flattened_values = distance_matrix.flatten()
         valid_indices = ~np.isnan(flattened_values)
         
-        # 将排序后的索引转换回原始矩阵的行列位置（即层对 (i, j)）
         valid_values = flattened_values[valid_indices]
         valid_flat_indices = np.where(valid_indices)[0]
         
@@ -172,22 +161,18 @@ class KVCacheManager:
     
     import numpy as np
     def cal_last_hidden_sim(self, model1, model2, kv_cache_share_layers_map, tokenizer, sents):
-        # 验证输出相似性
-        # 对每个校准样本，比较替换策略下模型与原始模型的输出表示相似性（通过余弦相似度）
         sim_ls = []
         for s in sents:
             encoded_inputs = tokenizer(s, max_length=64, truncation=True, return_tensors='pt')
             encoded_inputs.to('cuda')
-            # 对每个校准样本，比较替换策略下模型与原始模型的输出表示相似性（通过余弦相似度）
-            # 相似性计算 ：比较最后一层的隐藏状态（Hidden States）
             
-            # model1 使用原始缓存
+            # model1
             with torch.no_grad():
                 outputs1 = model1(**encoded_inputs, output_hidden_states=True,
                                   kv_cache_share_layers_map={i: i for i in range(len(model1.model.layers))})
             hidden_states1 = outputs1.hidden_states[-1]  # (1, seq_len, hidden)
             
-            # model2 使用共享策略（kv_cache_share_layers_map）
+            # model2（kv_cache_share_layers_map）
             with torch.no_grad():
                 outputs2 = model2(**encoded_inputs, output_hidden_states=True,
                                   kv_cache_share_layers_map=kv_cache_share_layers_map)
@@ -199,7 +184,6 @@ class KVCacheManager:
         return np.mean(sim_ls)
     
     def re_map(self, kv_cache_share_layers_map):
-        # 按排序后的层对依次尝试替换
         tmp_kv_cache_share_layers_map = {}
         for key, values in kv_cache_share_layers_map.items():
             if key == values:
@@ -214,49 +198,43 @@ class KVCacheManager:
         total_layers = self.model.config.num_hidden_layers
         compression_ratio = 0.0
         kv_cache_share_layers_map = {i: i for i in range(len(self.model.model.layers))}
-        # 遍历层对 ：按 pos_rank 降序排列的层对依次处理
         pos_rank = self.sort_distance()
         for i, pair in enumerate(tqdm(pos_rank)):
             tmp_kv_cache_share_layers_map = deepcopy(kv_cache_share_layers_map)
-            # 尝试将 pair[0] 的缓存替换为 pair[1] 的缓存
+            # replace pair[0] KV Cache as pair[1]'s
             if pair[0] < pair[1]:
                 pair[0], pair[1] = pair[1], pair[0]
             if pair[0] in shared_lay:
                 continue
             tmp_kv_cache_share_layers_map[pair[0]] = pair[1]
-            # 调用 re_map 确保共享策略的一致性（避免链式映射）
             tmp_kv_cache_share_layers_map = self.re_map(tmp_kv_cache_share_layers_map)
             
-            # 通过 cal_last_hidden_sim 验证输出相似性
             sim_value = self.cal_last_hidden_sim(self.model, self.model, tmp_kv_cache_share_layers_map, self.tokenizer,
                                                  self.calibration_set)
             
-            # 若相似性 > THRESHOLD，则保留替换
+            # If the similarity > THRESHOLD，keep the replacement
             if sim_value > threshold:
                 kv_cache_share_layers_map = deepcopy(tmp_kv_cache_share_layers_map)
                 shared_lay.append(pair[0])
                 shared_num_layers += 1
                 compression_ratio = shared_num_layers / total_layers
                 
-                # 实时报告压缩率和相似度
                 print(f"Step {i + 1}: Layer {pair[0]} -> {pair[1]} | "
                       f"Shared: {shared_num_layers}/{total_layers} | "
                       f"Compression: {compression_ratio:.2%} | "
                       f"Similarity: {sim_value:.4f}")
                 print(kv_cache_share_layers_map)
-            # 替换层数达到 SHARE_LAYERS（如 8 层）后停止
             if shared_num_layers >= max_shared_layers:
                 print(
                     f"Reached target compression: {compression_ratio:.2%} ({shared_num_layers}/{total_layers} layers)")
                 break
         
-        # 计算并报告最终压缩率
         final_compression = len(shared_lay) / total_layers
         print(f"\nStrategy built with {len(shared_lay)}/{total_layers} layers shared")
         print(f"Final compression ratio: {final_compression:.2%} ({final_compression * 100:.1f}%)")
         
-        # 关键：检查压缩率是否过高
-        if final_compression > 0.25:  # KVSharer论文推荐不超过25%
+        # Check if the compression is too high
+        if final_compression > 0.25:
             print(
                 f"⚠️ WARNING: Compression ratio {final_compression:.2%} exceeds recommended 25% - may cause accuracy drop")
         
