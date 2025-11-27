@@ -54,7 +54,8 @@ class KVCacheManager:
             max_shared_layers: int = 1,
             device: str = "cuda",
             share_similar_layers: bool = False,
-            use_euclidean_distance: bool = True
+            use_euclidean_distance: bool = True,
+            protect_final_ratio: float = 0.15  # 新增：保护最后 N% 的层
     ):
         """
         初始化KVCacheManager
@@ -66,13 +67,51 @@ class KVCacheManager:
             use_euclidean_distance (bool):
                 - True: 使用欧氏距离计算层间差异 (KVSharer原始论文方法，推荐)
                 - False: 使用余弦相似度计算层间差异
+            protect_final_ratio (float):
+                - 保护最后 N% 的层不被共享（默认 0.15 = 15%）
+                - 这些层通常负责决策和停止判断，共享会导致输出膨胀
+                - 推荐范围：0.10 ~ 0.20（即保护最后 10%-20% 的层）
         """
+        
         self.model = model
         self.tokenizer = tokenizer
         self.calibration_set = calibration_set
         self.threshold = threshold
         self.max_shared_layers = max_shared_layers
-        self.num_layers = len(model.model.layers)
+        self.protect_final_ratio = protect_final_ratio  # 保存配置
+        # 不同模型的顶层容器命名可能不同：
+        #   - Llama / Qwen 等：model.model.layers 或 model.model.decoder.layers
+        #   - Gemma2：model.model.layers
+        #   - Exaone / GLM 等：可能是 model.transformer.layers 或 model.layers
+        # 统一尝试多种路径，失败则回退到 config.num_hidden_layers。
+        def _extract_layers(mod):
+            candidate_attrs = [
+                "model.layers",            # 常见: Qwen2ForCausalLM
+                "model.decoder.layers",    # 某些架构 decoder 下挂 layers
+                "transformer.layers",      # ChatGLM / Exaone 类似命名
+                "layers",                  # 直接挂在最外层
+            ]
+            for attr_path in candidate_attrs:
+                cur = mod
+                ok = True
+                for part in attr_path.split('.'):
+                    if not hasattr(cur, part):
+                        ok = False
+                        break
+                    cur = getattr(cur, part)
+                if ok and isinstance(cur, (list, tuple)) or (hasattr(cur, '__len__') and all(hasattr(l, 'forward') for l in cur)):
+                    return cur
+            return None
+
+        self._layers_ref = _extract_layers(model)
+        if self._layers_ref is None:
+            # 最后回退：根据配置隐藏层数生成一个 range 供后续使用
+            if hasattr(model, 'config') and hasattr(model.config, 'num_hidden_layers'):
+                self.num_layers = model.config.num_hidden_layers
+            else:
+                raise AttributeError("无法自动解析模型层集合，请检查模型结构并添加自定义解析逻辑。")
+        else:
+            self.num_layers = len(self._layers_ref)
         self.kv_cache_list = []  # 存储校准后的KV缓存
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.share_similar_layers = share_similar_layers
@@ -127,15 +166,21 @@ class KVCacheManager:
         logger.info(f"校准完成，收集了 {len(self.kv_cache_list)} 个样本的KV缓存")
     
     def average_kv_cache(self, ):
+        """将收集到的 HybridCache / DynamicCache 统一转换为 (key,value) 层列表并做逐层平均。
+
+        注意：Gemma2 使用 HybridCache，不支持 len() / 迭代；需要通过 .key_cache / .value_cache 访问。
+        当前实现假设所有校准样本输入长度一致 (max_length)，否则需要对不同长度进行裁剪或对齐。
+        """
         num_layers = len(self.kv_cache_list[0])
         # 创建一个与 kv_cache_list 结构一致的列表 avg_past_key_values，用于存储每层 KV 缓存的平均值
         # [num_samples][num_layers][key, value]
         # avg_past_key_values：一个列表，每个元素是 (key_avg, value_avg)，初始值为全零张量，后续用于存储每层 Key 和 Value 缓存的平均值
         # 创建与 kv_cache_list[0][i][0]（第 0 个样本的第 i 层 Key 缓存）形状和数据类型相同的全零张量。
         # 示例：若 kv_cache_list[0][i][0] 的形状为 [1, 32, 64, 128]（batch_size=1, num_heads=32, seq_len=64, head_dim=128），则 torch.zeros_like(...) 会生成相同形状的零张量[[test_internlm.txt]]。
-        avg_past_key_values = [(torch.zeros_like(self.kv_cache_list[0][i][0]), torch.zeros_like(self.kv_cache_list[0][i][1])) for
-                               i in range(num_layers)]
-        
+        avg_past_key_values = [
+            (torch.zeros_like(self.kv_cache_list[0][i][0]), torch.zeros_like(self.kv_cache_list[0][i][1])) for
+            i in range(num_layers)]
+
         for past_key_values in tqdm(self.kv_cache_list):
             for i, (key, value) in enumerate(past_key_values):
                 try:
@@ -143,10 +188,60 @@ class KVCacheManager:
                     avg_past_key_values[i] = (avg_past_key_values[i][0] + key, avg_past_key_values[i][1] + value)
                 except:
                     pass
-        
+
+
         # 对累加后的 Key 和 Value 取平均值，得到每层的平均 KV 缓存
         num_elements = len(self.kv_cache_list)
         self.avg_past_key_values = [(key / num_elements, value / num_elements) for key, value in avg_past_key_values]
+
+        # if len(self.kv_cache_list) == 0:
+        #     logger.warning("kv_cache_list 为空，无法平均")
+        #     return
+        #
+        # first_cache = self.kv_cache_list[0]
+        #
+        # # 统一抽取所有样本的每层 KV (保持张量形状)
+        # extracted_all = []
+        # for cache in self.kv_cache_list:
+        #     if hasattr(cache, 'key_cache') and hasattr(cache, 'value_cache'):
+        #         # HybridCache / StaticCache / DynamicCache 都有 key_cache / value_cache 列表
+        #         layer_pairs = []
+        #         for layer_idx in range(self.num_layers):
+        #             try:
+        #                 k = cache.key_cache[layer_idx]
+        #                 v = cache.value_cache[layer_idx]
+        #             except IndexError:
+        #                 # 有可能某些层在 DynamicCache 中被跳过
+        #                 k = torch.zeros_like(cache.key_cache[0])
+        #                 v = torch.zeros_like(cache.value_cache[0])
+        #             layer_pairs.append((k, v))
+        #         extracted_all.append(layer_pairs)
+        #     else:
+        #         raise TypeError(f"不支持的缓存类型: {type(cache)}，缺少 key_cache/value_cache 属性")
+        #
+        # num_layers = len(extracted_all[0])
+        #
+        #
+        # # 初始化平均累加器
+        # avg_past_key_values = [
+        #     (
+        #         torch.zeros_like(extracted_all[0][i][0]),
+        #         torch.zeros_like(extracted_all[0][i][1])
+        #     ) for i in range(num_layers)
+        # ]
+        #
+        # # 累加
+        # for sample_layers in tqdm(extracted_all, desc="累加KV缓存"):
+        #     for i, (key, value) in enumerate(sample_layers):
+        #         avg_past_key_values[i] = (
+        #             avg_past_key_values[i][0] + key,
+        #             avg_past_key_values[i][1] + value,
+        #         )
+        #
+        # num_samples = len(extracted_all)
+        # self.avg_past_key_values = [
+        #     (k / num_samples, v / num_samples) for k, v in avg_past_key_values
+        # ]
     
     # 计算两个张量（如 KV 缓存）的余弦相似度
     def compute_cosine_similarity(self, tensor1, tensor2):
@@ -210,6 +305,183 @@ class KVCacheManager:
                     distance_matrix[j, i] = avg_similarity  # 对称矩阵
         
         return distance_matrix
+
+    # ------------------------- 新增: 代理指标与自动决策 -------------------------
+    def compute_proxy_metrics(self, distance_matrix: np.ndarray) -> Dict[str, Any]:
+        """根据距离/相似度矩阵提取统计特征, 作为自动决策的代理指标。
+
+        说明:
+          - 对于欧氏距离: 值越大越不相似, 我们关注分布的离散程度与长尾比例;
+          - 对于余弦相似度: 值越大越相似, 我们反向使用 (1 - 相似度) 当作"距离"再做统计, 保持统一性。
+        指标:
+          - mean / std / cv: 分布集中与波动情况
+          - tail_ratio: 高于 (mean + std) 的元素占比 (长尾程度)
+          - spread: max - min 反映跨度
+          - topk_gap: 前 K (默认 5) 与后 K 的均值差, 反映头部与尾部区分度
+        """
+        tri_vals = []
+        L = distance_matrix.shape[0]
+        for i in range(L):
+            for j in range(i + 1, L):
+                tri_vals.append(distance_matrix[i, j])
+        tri_vals = np.array(tri_vals)
+        if not self.use_euclidean_distance:
+            # 余弦相似度 -> 转换为“伪距离”统一特征方向
+            tri_vals = 1 - tri_vals
+        mean_v = float(np.mean(tri_vals))
+        std_v = float(np.std(tri_vals))
+        cv_v = std_v / (mean_v + 1e-6)
+        max_v = float(np.max(tri_vals))
+        min_v = float(np.min(tri_vals))
+        spread_v = max_v - min_v
+        tail_threshold = mean_v + std_v
+        tail_ratio = float(np.mean(tri_vals > tail_threshold))
+        sorted_vals = np.sort(tri_vals)[::-1]  # 从大到小 (更不相似 / 更大伪距离)
+        k = min(5, len(sorted_vals))
+        topk_mean = float(np.mean(sorted_vals[:k])) if k > 0 else 0.0
+        tailk_mean = float(np.mean(sorted_vals[-k:])) if k > 0 else 0.0
+        topk_gap = topk_mean - tailk_mean
+
+        metrics = {
+            "mean": mean_v,
+            "std": std_v,
+            "cv": cv_v,
+            "max": max_v,
+            "min": min_v,
+            "spread": spread_v,
+            "tail_ratio": tail_ratio,
+            "topk_gap": topk_gap,
+            "num_pairs": len(tri_vals),
+        }
+        logger.info(f"[AUTO][ProxyMetrics] {json.dumps(metrics, indent=2)}")
+        return metrics
+
+    def auto_decide_max_shared_layers(self, min_layers: int = 1, max_layers: int = 6) -> int:
+        """自动决策共享层(pair)数量 (max_shared_layers)。
+
+        设计思路(启发式):
+          - 使用 compute_proxy_metrics 输出的统计特征决定区分度是否足够。
+          - 目标: 当层间差异分布具有足够的长尾 & 高离散度时, 可以尝试共享更多层。
+          - 防止过度压缩: 仍然遵循论文压缩率<25%原则, 即 shared_pairs <= 0.25 * num_layers。
+
+        策略规则 (欧氏距离 / 伪距离通用):
+          1. 基础层数 = 1
+          2. 若 cv > 0.20 且 tail_ratio > 0.25 -> 至少 2
+          3. 若 cv > 0.28 且 tail_ratio > 0.35 且 topk_gap > 0.10 * mean -> 3
+          4. 若 cv > 0.35 且 tail_ratio > 0.40 且 topk_gap > 0.15 * mean -> 4
+          5. 若 cv > 0.40 且 tail_ratio > 0.45 且 spread > 0.50 * mean -> 5
+          * 每一步是累进的; 满足越高层级规则, 共享层数越多。
+          * 上限受 max_layers 以及 25% 压缩率限制。
+        """
+        distance_matrix = self.analyze_kv_similarity()
+        metrics = self.compute_proxy_metrics(distance_matrix)
+        num_layers = self.num_layers
+        max_allowed_by_compression = max(int(0.25 * num_layers), 1)  # 25% 原则 (pairs 数)
+        heuristic_cap = min(max_layers, max_allowed_by_compression)
+
+        decided = min_layers
+        cv_v = metrics["cv"]
+        tail_ratio = metrics["tail_ratio"]
+        topk_gap = metrics["topk_gap"]
+        mean_v = metrics["mean"]
+        spread_v = metrics["spread"]
+
+
+        # 依次提升层数
+        if cv_v > 0.20 and tail_ratio > 0.25:
+            decided = 2
+        if cv_v > 0.28 and tail_ratio > 0.35 and topk_gap > 0.10 * mean_v:
+            decided = 3
+        if cv_v > 0.35 and tail_ratio > 0.40 and topk_gap > 0.15 * mean_v:
+            decided = 4
+        if cv_v > 0.40 and tail_ratio > 0.45 and spread_v > 0.50 * mean_v:
+            decided = 5
+
+
+        decided = int(min(decided, heuristic_cap))
+
+        logger.info(
+            f"[AUTO] num_layers={num_layers} heuristic_cap={heuristic_cap} cv={cv_v:.3f} tail={tail_ratio:.3f} gap={topk_gap:.3f} -> decided_pairs={decided}"
+        )
+        print(f"🔮 自动决策: 建议共享 {decided} 个层对 (pairs), 压缩率约 {decided/num_layers:.2%}")
+        return max(min_layers, decided)
+
+    # ------------------------- Micro-Probing: KL 评估候选层对 -------------------------
+    def _generate_scores(self, prompt: str, kv_map: Dict[int, int], max_new_tokens: int = 8):
+        """对单个 prompt 生成少量 tokens 并返回 logits 列表 (每步一个)。
+        使用最小生成步长以降低开销。"""
+        inputs = self.tokenizer(prompt, return_tensors='pt', truncation=True, padding=True).to(self.device)
+        try:
+            with torch.no_grad():
+                gen_out = self.model.generate(
+                    **inputs,
+                    kv_cache_share_layers_map=kv_map,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    num_beams=1,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                )
+            return gen_out.scores  # List[tensor(batch, vocab)]
+        except Exception as e:
+            logger.warning(f"微探针生成失败: {e}")
+            return []
+
+    def _kl_div(self, base_scores, alt_scores) -> float:
+        """计算两个生成序列 logits 列表的平均 KL(P_base || P_alt)。"""
+        if len(base_scores) == 0 or len(alt_scores) == 0:
+            return 1e6  # 极大代价代表不可用
+        kl_vals = []
+        for b, a in zip(base_scores, alt_scores):
+            # softmax -> probs
+            pb = torch.softmax(b.float(), dim=-1)
+            pa = torch.softmax(a.float(), dim=-1)
+            kl = torch.sum(pb * (torch.log(pb + 1e-8) - torch.log(pa + 1e-8)), dim=-1)  # batch KL
+            kl_vals.append(kl.mean().item())
+        return float(np.mean(kl_vals))
+
+    def micro_probe_rank(self) -> List[Tuple[int, int]]:
+        """对候选层对进行微探针 KL 代价评估, 返回按代价升序排序的层对列表。
+
+        流程:
+          1. 先按原距离/相似度策略获取所有层对 (pos_rank_raw)
+          2. 截取前 micro_probe_top_n 个候选
+          3. 对每个候选构造单层共享映射并对前 micro_probe_calib_samples 个校准样本做最小 decode
+          4. 计算 KL 代价, 记录 (pair, kl)
+          5. 按 kl 升序输出层对 (越小越稳定 -> 优先共享)
+        """
+        pos_rank_raw = self.sort_similarity(self.share_similar_layers)
+        top_n = getattr(self, 'micro_probe_top_n', 20)
+        sample_n = getattr(self, 'micro_probe_calib_samples', 3)
+        candidate_pairs = pos_rank_raw[:top_n]
+        base_map = {i: i for i in range(self.num_layers)}
+        # 预先对样本计算 baseline scores
+        calib_samples = self.calibration_set[:sample_n]
+        baseline_scores_per_prompt = []
+        for p in calib_samples:
+            baseline_scores_per_prompt.append(self._generate_scores(p, base_map))
+        results = []
+        for (a, b) in candidate_pairs:
+            # 规范化方向: 高索引映射到低索引
+            src, tgt = (a, b)
+            if src < tgt:
+                src, tgt = tgt, src
+            test_map = base_map.copy()
+            test_map[src] = tgt
+            test_map = self.re_map(test_map)
+            kl_all = []
+            for p_idx, p in enumerate(calib_samples):
+                alt_scores = self._generate_scores(p, test_map)
+                base_scores = baseline_scores_per_prompt[p_idx]
+                kl_val = self._kl_div(base_scores, alt_scores)
+                kl_all.append(kl_val)
+            avg_kl = float(np.mean(kl_all)) if len(kl_all) else 1e6
+            results.append(((src, tgt), avg_kl))
+            print(f"[MicroProbe] Pair {src}->{tgt} KL={avg_kl:.6f}")
+        # 按 KL 升序排列
+        results.sort(key=lambda x: x[1])
+        ranked_pairs = [pair for pair, _ in results]
+        return ranked_pairs
     
     def sort_similarity(self, share_similar_layers=False):
         """
@@ -280,8 +552,13 @@ class KVCacheManager:
             
             # model1 使用原始缓存
             with torch.no_grad():
-                outputs1 = model1(**encoded_inputs, output_hidden_states=True,
-                                  kv_cache_share_layers_map={i: i for i in range(len(model1.model.layers))})
+                # 使用 num_hidden_layers 配置而不是直接访问 model.model.layers，提升通用性
+                base_layers = model1.config.num_hidden_layers if hasattr(model1, 'config') and hasattr(model1.config, 'num_hidden_layers') else self.num_layers
+                outputs1 = model1(
+                    **encoded_inputs,
+                    output_hidden_states=True,
+                    kv_cache_share_layers_map={i: i for i in range(base_layers)}
+                )
             hidden_states1 = outputs1.hidden_states[-1]  # (1, seq_len, hidden)
             
             # model2 使用共享策略（kv_cache_share_layers_map）
@@ -296,23 +573,70 @@ class KVCacheManager:
         return np.mean(sim_ls)
     
     def re_map(self, kv_cache_share_layers_map):
-        # 按排序后的层对依次尝试替换
-        tmp_kv_cache_share_layers_map = {}
-        for key, values in kv_cache_share_layers_map.items():
-            if key == values:
-                tmp_kv_cache_share_layers_map[key] = values
-            else:
-                tmp_kv_cache_share_layers_map[key] = tmp_kv_cache_share_layers_map[values]
-        return tmp_kv_cache_share_layers_map
+        """将链式映射扁平化，但保留非自映射关系。
+
+        原实现的问题：
+        - 当只有一条映射 (e.g. 26 -> 0) 时，迭代顺序先看到 0->0 再看到 26->0，
+          第二步将 26 映射为 tmp[0] (即 0)，最终结果仍是 26->0，但后续 build 时
+          kv_cache_share_layers_map 被重新赋值后, 因逻辑缺陷在一些情况下可能意外回退为自映射。
+        - 更关键的是如果写法稍有调整，容易出现把首个非自映射“折叠”成自映射的情况导致单层共享丢失。
+
+        新策略：对每个 key 找到最终根 target（沿映射链下降到自映射的最底层），保留 key->root。
+        这样单条映射永远不会消失；多条映射链会被规范化。
+        """
+        def _root(i):
+            visited = set()
+            while kv_cache_share_layers_map.get(i, i) != i:
+                if i in visited:  # 防止潜在环
+                    break
+                visited.add(i)
+                i = kv_cache_share_layers_map[i]
+            return i
+
+        flattened = {}
+        for k, v in kv_cache_share_layers_map.items():
+            r = _root(v)
+            flattened[k] = r
+        return flattened
     
     def build_sharing_strategy(self, threshold, max_shared_layers) -> Dict[int, int]:
         shared_lay = []
         shared_num_layers = 0
         total_layers = self.model.config.num_hidden_layers
         compression_ratio = 0.0
-        kv_cache_share_layers_map = {i: i for i in range(len(self.model.model.layers))}
-        # 遍历层对：按指定策略排列的层对依次处理
-        pos_rank = self.sort_similarity(self.share_similar_layers)
+        kv_cache_share_layers_map = {i: i for i in range(self.num_layers)}
+        
+        # ============ 🛡️ 保护决策层：避免共享最后几层 ============
+        # 最后 N% 的层通常负责高级推理和停止判断，共享这些层会导致：
+        #   1. 输出长度膨胀（无法正确判断何时停止）
+        #   2. 生成质量下降（决策能力受损）
+        #   3. 重复内容增加
+        protected_final_layers = max(4, int(total_layers * self.protect_final_ratio))  # 至少保护 4 层
+        protected_layer_ids = set(range(total_layers - protected_final_layers, total_layers))
+        
+        print(f"🛡️ Protecting final {protected_final_layers} layers from sharing (decision-critical)")
+        print(f"   Protection ratio: {self.protect_final_ratio:.1%} of total {total_layers} layers")
+        print(f"   Protected layer IDs: {sorted(protected_layer_ids)}")
+        print(f"   Shareable layers: 0-{total_layers - protected_final_layers - 1}")
+        
+        # ---------------- Micro-Probing 支持 ----------------
+        # 如果启用 micro probing, 使用 KL 代价排序的候选对替换原始距离排序
+        if getattr(self, 'micro_probe_enabled', False):
+            try:
+                pos_rank = self.micro_probe_rank()
+                print(f"[MicroProbe] 使用 KL 代价排序候选层对, 数量={len(pos_rank)}")
+            except Exception as e:
+                logger.warning(f"Micro probing 失败, 回退到距离排序: {e}")
+                pos_rank = self.sort_similarity(self.share_similar_layers)
+        else:
+            # 遍历层对：按指定策略排列的层对依次处理
+            pos_rank = self.sort_similarity(self.share_similar_layers)
+
+        # ---------------- Adaptive Threshold 支持 ----------------
+        adaptive_enabled = getattr(self, 'adaptive_threshold_enabled', False)
+        threshold_decay = getattr(self, 'adaptive_threshold_decay', 0.99)
+        adaptive_active = False  # 首对触发后开始衰减
+        current_threshold = threshold
         for i, pair in enumerate(tqdm(pos_rank)):
             tmp_kv_cache_share_layers_map = deepcopy(kv_cache_share_layers_map)
             # 尝试将 pair[0] 的缓存替换为 pair[1] 的缓存
@@ -321,6 +645,19 @@ class KVCacheManager:
                 pair = (pair[1], pair[0])  # 创建新的元组而不是修改原元组
             if pair[0] in shared_lay:
                 continue
+            
+            # ============ 🛡️ 跳过受保护的决策层 ============
+            if pair[0] in protected_layer_ids:
+                if (i % 50 == 0):  # 每 50 个候选打印一次，避免刷屏
+                    print(f"⏭️  Skip layer {pair[0]} (protected decision layer)")
+                continue
+            
+            # 如果 pair[1] 也在保护区，也跳过（避免指向被保护层）
+            if pair[1] in protected_layer_ids:
+                if (i % 50 == 0):
+                    print(f"⏭️  Skip pair ({pair[0]}, {pair[1]}) - target layer {pair[1]} is protected")
+                continue
+            
             tmp_kv_cache_share_layers_map[pair[0]] = pair[1]
             # 调用 re_map 确保共享策略的一致性（避免链式映射）
             tmp_kv_cache_share_layers_map = self.re_map(tmp_kv_cache_share_layers_map)
@@ -328,8 +665,18 @@ class KVCacheManager:
             # 通过 cal_last_hidden_sim 验证输出相似性
             sim_value = self.cal_last_hidden_sim(self.model, self.model, tmp_kv_cache_share_layers_map, self.tokenizer, self.calibration_set)
             
-            # 若相似性 > THRESHOLD，则保留替换
-            if sim_value > threshold:
+            # 若启用自适应阈值且第一对的相似度远高于固定阈值, 激活衰减模式
+            if adaptive_enabled and (not adaptive_active) and sim_value > 0.995:
+                adaptive_active = True
+                print(f"[AdaptiveThreshold] 首个映射相似度 {sim_value:.4f} > 0.995, 启动阈值衰减模式")
+            if adaptive_active:
+                # 以已接受的共享层数为步数进行动态衰减, 保持单调降低
+                current_threshold = threshold * (threshold_decay ** max(shared_num_layers, 1))
+            else:
+                current_threshold = threshold
+            
+            # 若相似性 > 当前阈值，则保留替换
+            if sim_value > current_threshold:
                 kv_cache_share_layers_map = deepcopy(tmp_kv_cache_share_layers_map)
                 shared_lay.append(pair[0])
                 shared_num_layers += 1
@@ -339,7 +686,7 @@ class KVCacheManager:
                 print(f"Step {i + 1}: Layer {pair[0]} -> {pair[1]} | "
                       f"Shared: {shared_num_layers}/{total_layers} | "
                       f"Compression: {compression_ratio:.2%} | "
-                      f"Similarity: {sim_value:.4f}")
+                      f"Similarity: {sim_value:.4f} | Threshold={current_threshold:.4f}")
                 print(kv_cache_share_layers_map)
             # 替换层数达到 SHARE_LAYERS（如 8 层）后停止
             if shared_num_layers >= max_shared_layers:
@@ -349,20 +696,35 @@ class KVCacheManager:
         
         # 计算并报告最终压缩率
         final_compression = len(shared_lay) / total_layers
-        print(f"\nStrategy built with {len(shared_lay)}/{total_layers} layers shared")
+        print(f"\n{'='*60}")
+        print(f"📊 SHARING STRATEGY SUMMARY")
+        print(f"{'='*60}")
+        print(f"Strategy built with {len(shared_lay)}/{total_layers} layers shared")
         print(f"Final compression ratio: {final_compression:.2%} ({final_compression * 100:.1f}%)")
+        print(f"Protected layers (not shared): {sorted(protected_layer_ids)}")
+        print(f"Shared layers: {sorted(shared_lay)}")
         self.final_compression = final_compression
         
         # 关键：检查压缩率是否过高
         if final_compression > 0.25:  # KVSharer论文推荐不超过25%
             print(
                 f"⚠️ WARNING: Compression ratio {final_compression:.2%} exceeds recommended 25% - may cause accuracy drop")
-            
-        print('1: ', kv_cache_share_layers_map)
-        return kv_cache_share_layers_map
+        
+        # 验证没有保护层被共享
+        violation = protected_layer_ids.intersection(shared_lay)
+        if violation:
+            logger.error(f"❌ CRITICAL: Protected layers were shared: {violation}")
+            raise ValueError(f"Protected layers {violation} were incorrectly shared!")
+        else:
+            print(f"✅ Protection verified: No decision layers were shared")
+        
+        print(f"{'='*60}\n")
+        print('Final mapping: ', kv_cache_share_layers_map)
+        return kv_cache_share_layers_map, final_compression
     
 class ModelInference:
     def __init__(self, args, device: str = "cuda"):
+        self.args = args
         self.model_name = args.aggregator
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.download_dir = args.download_dir
@@ -370,6 +732,14 @@ class ModelInference:
         self.model = None
         self.math500_enabled = args.math500_enabled
         self.attn_implementation = args.attn_implementation
+        # 关键: 提前记录 auto_decide_layers 标志, 确保 _load_model -> _load_kvsharer_model 能读取到
+        self.auto_decide_layers = getattr(args, 'auto_decide_layers', False)
+        # 提前缓存微探针与自适应阈值相关参数（之前缺失导致 micro_probe_enabled 永远为 False）
+        self.micro_probe_enabled = getattr(args, 'micro_probe_enabled', False)
+        self.micro_probe_top_n = getattr(args, 'micro_probe_top_n', 20)
+        self.micro_probe_calib_samples = getattr(args, 'micro_probe_calib_samples', 3)
+        self.adaptive_threshold_enabled = getattr(args, 'adaptive_threshold_enabled', False)
+        self.adaptive_threshold_decay = getattr(args, 'adaptive_threshold_decay', 0.99)
 
         # 策略配置
         self.strategy = args.strategy  # "kvsharer", "adaskip", "fusion", "baseline"
@@ -465,19 +835,25 @@ class ModelInference:
                 wiki_data = f.readlines()
                 f.close()
 
-            self.calibration_data = wiki_data[0:60]  # 使用前30个样本进行校准
+            self.calibration_data = wiki_data[0:30]  # 使用前30个样本进行校准
         
     
     def _load_kvsharer_model(self, model_id):
         # 加载支持KVSharer的模型
         self.load_calibration_data()
-        
         from llama_real_share.modeling_llama_kvsharer_4470 import LlamaForCausalLM as LlamaR1ForCausalLM
         from qwen_real_share.qwenR1_test import Qwen2ForCausalLM
+        from qwen_real_share.modeling_gemma2 import Gemma2ForCausalLM
+        from qwen_real_share.modeling_exaone import ExaoneForCausalLM
+        from qwen_real_share.modeling_glm import ChatGLMForConditionalGeneration
         
         MODEL_CLASS_MAP = {
             'QwenR1': Qwen2ForCausalLM,
             'LlamaR1': LlamaR1ForCausalLM,
+            'Gemma': Gemma2ForCausalLM,
+            'Qwen': Qwen2ForCausalLM,
+            'Exaone': ExaoneForCausalLM,
+            'GLM': ChatGLMForConditionalGeneration
         }
         model_class = MODEL_CLASS_MAP.get(self.model_name)
         if not model_class:
@@ -506,13 +882,72 @@ class ModelInference:
             tokenizer=self.tokenizer,
             calibration_set=self.calibration_data,
             threshold=self.threshold,
-            max_shared_layers=self.max_shared_layers
+            max_shared_layers=self.max_shared_layers,
+            protect_final_ratio=getattr(self.args, 'protect_final_ratio', 0.15)  # 新增
         )
+        # 传递微探针与阈值自适应配置到 manager
+        self.kv_manager.micro_probe_enabled = getattr(self, 'micro_probe_enabled', False)
+        self.kv_manager.micro_probe_top_n = getattr(self, 'micro_probe_top_n', 20)
+        self.kv_manager.micro_probe_calib_samples = getattr(self, 'micro_probe_calib_samples', 3)
+        self.kv_manager.adaptive_threshold_enabled = getattr(self, 'adaptive_threshold_enabled', False)
+        self.kv_manager.adaptive_threshold_decay = getattr(self, 'adaptive_threshold_decay', 0.99)
+        
         
         # 执行校准和策略构建
         self.kv_manager.calibrate()
-        self.kv_cache_share_layers_map = self.kv_manager.build_sharing_strategy(self.threshold, self.max_shared_layers)
-    
+        
+        # 如果启用自动决策, 先动态决定 max_shared_layers
+        if getattr(self, 'auto_decide_layers', False):
+            decided_pairs = self.kv_manager.auto_decide_max_shared_layers()
+            self.max_shared_layers = decided_pairs
+            print(f"[AUTO] 使用自动决策的 max_shared_layers={self.max_shared_layers}")
+        self.kv_cache_share_layers_map, compression_ratio = self.kv_manager.build_sharing_strategy(self.threshold, self.max_shared_layers)
+
+        # 将 {index: target_index} 转换为 {"model.layers.X.self_attn.attn": "model.layers.Y.self_attn.attn"}
+        # 不同模型的 Attention prefix 命名不统一，需要根据模型类选择正确前缀
+        model_cls_name = self.model.__class__.__name__
+        def idx_to_attn_name(idx: int) -> str:
+            if model_cls_name in ["Qwen2ForCausalLM", "LlamaR1ForCausalLM", "LlamaForCausalLM"]:
+                return f"model.layers.{idx}.self_attn.attn"
+            elif model_cls_name in ["Gemma2ForCausalLM"]:
+                return f"model.layers.{idx}.self_attn.attn"  # Gemma2 当前改造后保持一致
+            elif model_cls_name in ["ExaoneForCausalLM"]:
+                # 依据 Exaone 模型结构，Block 列表通常挂在 transformer.h / 或者统一映射为 model.layers.
+                # 若后续 vLLM 打印 prefix 不匹配，可在日志中捕获并调整这里。
+                return f"model.layers.{idx}.self_attn.attn"
+            elif model_cls_name in ["ChatGLMForConditionalGeneration"]:
+                # ChatGLM 可能的实际 prefix（需要以运行时 print 验证）
+                return f"transformer.layers.{idx}.self_attention.core_attention"
+            else:
+                # 默认退回通用命名，便于后续在 patch 时观察是否匹配。
+                return f"model.layers.{idx}.self_attn.attn"
+
+        kv_share_name_map = {}
+        for src_idx, tgt_idx in self.kv_cache_share_layers_map.items():
+            if src_idx == tgt_idx:
+                # 自身映射不写入，保持策略文件精简，只记录真正共享的层
+                continue
+            kv_share_name_map[idx_to_attn_name(src_idx)] = idx_to_attn_name(tgt_idx)
+
+
+        strat = {
+            'model_id': model_id,
+            'kv_cache_share_layers_map': kv_share_name_map,
+            'threshold': self.threshold,
+            'max_shared_layers': self.max_shared_layers,
+            'compression_ratio': compression_ratio,
+        }
+        out_path = f'../symbolic_moe_new/kv_sharer_strategy_update/{self.model_name}_share{self.max_shared_layers}_thres{self.threshold}.json'
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(strat, f, indent=2, ensure_ascii=False)
+        print(f"Saved strategy: {out_path} | shared_layers={self.max_shared_layers} | compression_ratio={compression_ratio:.2%}")
+        print("Converted kv_cache_share_layers_map (index -> name):")
+        for k, v in strat['kv_cache_share_layers_map'].items():
+            print(f"  {k} -> {v}")
+        print("Inject into vLLM: engine.kv_shared_layers = set(shared)")
+
+        sys.exit()
+        
     def _load_fusion_model(self, model_id):
         try:
             from E2E.model.llama_ADA import LlamaForCausalLM, MyLlamaConfig
@@ -536,13 +971,14 @@ class ModelInference:
                 tokenizer=self.tokenizer,
                 calibration_set=self.calibration_data,
                 threshold=self.threshold,
-                max_shared_layers=self.max_shared_layers
+                max_shared_layers=self.max_shared_layers,
+                protect_final_ratio=getattr(self.args, 'protect_final_ratio', 0.15)  # 新增
             )
             
             # 执行校准和策略构建
             self.load_calibration_data()
             self.kv_manager.calibrate()
-            self.kv_cache_share_layers_map = self.kv_manager.build_sharing_strategy(self.threshold,
+            self.kv_cache_share_layers_map, _ = self.kv_manager.build_sharing_strategy(self.threshold,
                                                                                     self.max_shared_layers)
             # AdaSkip的重要性收集和跳层决策完全在模型内部自动处理
             # 无需外部管理器，模型在推理过程中会自动：
@@ -1081,6 +1517,23 @@ def parse_args() -> argparse.Namespace:
                         help="KVSharer相似度阈值")
     parser.add_argument("--max_shared_layers", type=int, default=1,
                         help="KVSharer最大共享层数")
+    parser.add_argument("--auto_decide_layers", type=str2bool, default=False,
+                        help="是否启用基于校准统计特征的自动共享层数决策 (忽略 --max_shared_layers 手动值)")
+    # Micro-Probing & Adaptive Threshold
+    parser.add_argument("--micro_probe_enabled", type=str2bool, default=False,
+                        help="是否启用微探针 KL 代价评估候选层对")
+    parser.add_argument("--micro_probe_top_n", type=int, default=20,
+                        help="微探针评估的候选层对数量上限")
+    parser.add_argument("--micro_probe_calib_samples", type=int, default=3,
+                        help="用于微探针的校准样本数 (减少开销)")
+    parser.add_argument("--adaptive_threshold_enabled", type=str2bool, default=False,
+                        help="是否启用自适应阈值衰减")
+    parser.add_argument("--adaptive_threshold_decay", type=float, default=0.99,
+                        help="阈值衰减因子, 激活后每接受一对共享阈值乘以该因子")
+    
+    # 🛡️ 决策层保护参数（新增）
+    parser.add_argument("--protect_final_ratio", type=float, default=0.15,
+                        help="保护最后N%%的层不被共享（默认0.15=15%%），避免输出膨胀。推荐范围: 0.10-0.20")
 
     # AdaSkip参数
     parser.add_argument('--skip_sub_layer_num', type=int, default=8, 
@@ -1097,7 +1550,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--attn_implementation",
         type=str,
-        default="flash_attention_2",
+        default="sdpa",
         choices=["flash_attention_2", "sdpa", "eager"],
     )
     
@@ -1138,6 +1591,8 @@ def main():
         
         # 运行实验
         runner = ExperimentRunner(args)
+        # 将自动决策标记传递到 ModelInference 中
+        setattr(runner.model_tester, 'auto_decide_layers', args.auto_decide_layers)
         runner.run_evaluation()
         logger.info("参数配置: " + str(args))
 
